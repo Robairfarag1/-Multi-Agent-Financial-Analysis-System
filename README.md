@@ -10,4 +10,10 @@ Group project for building a multi-agent financial analysis system.
 ## Setup
 ```bash
 pip install -r requirements.txt
+## Usage
+
+### Download Tech Stock Prices
+```bash
+python3 notebooks/sanity_plot.py
+python3 notebooks/plot_ticker.py --ticker NVDA --period 1y --interval 1d
 

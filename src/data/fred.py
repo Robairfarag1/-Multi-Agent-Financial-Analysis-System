@@ -2,6 +2,14 @@ import os
 import pandas as pd
 import requests
 
+# NEW: ensure .env is loaded and overrides any old shell values
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except Exception:
+    # dotenv is optional; if not present, we rely on OS env only
+    pass
+
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 class MissingApiKey(RuntimeError):
@@ -15,7 +23,6 @@ def _load_cache(series_id: str) -> pd.DataFrame | None:
     path = _cache_path(series_id)
     if os.path.exists(path):
         df = pd.read_csv(path)
-        # basic schema check
         if set(df.columns) >= {"date", "value"}:
             df["date"] = pd.to_datetime(df["date"])
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
@@ -27,11 +34,11 @@ def _save_cache(series_id: str, df: pd.DataFrame) -> None:
 
 def _get_key() -> str:
     key = os.getenv("FRED_API_KEY")
-    if not key:
-        # defer failure until after we try to use cache
+    # Treat the demo/placeholder as missing too
+    if not key or key.strip().upper() == "YOUR_KEY":
         raise MissingApiKey(
-            "FRED_API_KEY not set. Add it later in your shell or a .env file.\n"
-            "Example:\n  export FRED_API_KEY=YOUR_KEY_HERE"
+            "FRED_API_KEY not set (or still 'YOUR_KEY'). Add it to .env or your shell.\n"
+            "Example:\n  echo 'FRED_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' > .env"
         )
     return key
 
@@ -45,8 +52,7 @@ def get_fred_series(series_id: str, start: str = "2015-01-01", use_cache: bool =
         if cached is not None:
             return cached
 
-    # No usable cache; try API
-    api_key = _get_key()  # raises clear error if not set
+    api_key = _get_key()
     params = {
         "series_id": series_id,
         "api_key": api_key,
@@ -66,7 +72,7 @@ def get_fred_series(series_id: str, start: str = "2015-01-01", use_cache: bool =
 
     return df
 
-# Convenience wrappers for your chosen indicators
+# Convenience wrappers
 def get_fedfunds(start="2015-01-01", use_cache: bool = True) -> pd.DataFrame:
     return get_fred_series("FEDFUNDS", start=start, use_cache=use_cache)
 
@@ -74,7 +80,6 @@ def get_dgs10(start="2015-01-01", use_cache: bool = True) -> pd.DataFrame:
     return get_fred_series("DGS10", start=start, use_cache=use_cache)
 
 def get_cpi(start="2015-01-01", use_cache: bool = True) -> pd.DataFrame:
-    # CPIAUCSL (index level). YoY % is units=pc1; we keep level for now (simpler).
     return get_fred_series("CPIAUCSL", start=start, use_cache=use_cache)
 
 def get_unrate(start="2015-01-01", use_cache: bool = True) -> pd.DataFrame:

@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+Tech Monthly (fixed robust)
+- Force-loads .env from multiple locations before reading keys
+- Handles tz-naive/aware comparisons in news
+- Graceful yfinance rate-limit handling
+- Saves to ../data_cache/Monthly
+"""
+
+import os, time, json, datetime as dt
+from typing import List, Dict, Any, Tuple
+import pandas as pd
+import numpy as np
+import requests
+
+# ---------- Optional deps ----------
+try:
+    import yfinance as yf
+except Exception as e:
+    raise SystemExit("Missing yfinance. Run: python3 -m pip install --user yfinance pandas numpy requests python-dotenv statsmodels nltk pyarrow matplotlib") from e
+
+try:
+    import statsmodels.api as sm
+    _SM_OK = True
+except Exception:
+    _SM_OK = False
+
+try:
+    import matplotlib.pyplot as plt  # noqa:F401
+    _PLT_OK = True
+except Exception:
+    _PLT_OK = False
+
+# ---------- ENV loading (robust) ----------
+def robust_env_load():
+    loaded = []
+    try:
+        from dotenv import load_dotenv, find_dotenv
+    except Exception:
+        print("[warn] python-dotenv not installed; env will not be auto-loaded.")
+        return loaded
+
+    # Try local .env (notebooks/)
+    p1 = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.isfile(p1):
+        if load_dotenv(p1, override=True): loaded.append(p1)
+
+    # Try repo root ../.env
+    p2 = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    if os.path.isfile(p2):
+        if load_dotenv(p2, override=True): loaded.append(p2)
+
+    # Try CWD via find_dotenv
+    try:
+        p3 = find_dotenv(usecwd=True)
+        if p3 and os.path.isfile(p3):
+            if load_dotenv(p3, override=True): loaded.append(p3)
+    except Exception:
+        pass
+
+    if not loaded:
+        print("[warn] No .env file could be loaded automatically. Keys must be in the process env.")
+    else:
+        print("[info] Loaded .env from:", " | ".join(loaded))
+    return loaded
+
+_ = robust_env_load()
+
+# ---------- Keys / constants ----------
+FRED_KEY     = os.getenv("af545f1dee482a6552309d2dd2e06fda")
+POLYGON_KEY  = os.getenv("61CPwAgcKao5Mm0N79i_jw3iZ5oAibST", "")
+FINNHUB_KEY  = os.getenv("d3i7slpr01qr304gpbr0d3i7slpr01qr304gpbrg", "")
+
+FRED_BASE    = "https://api.stlouisfed.org/fred/series/observations"
+POLY_BASE    = "https://api.polygon.io"
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+OUT_DIR   = os.path.join(REPO_ROOT, "data_cache", "Monthly")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+TECH_TICKERS = ["AAPL", "MSFT", "GOOGL", "NVDA", "META", "AMZN"]
+AI_BASKET    = ["NVDA", "META", "MSFT", "GOOGL", "AMD", "AVGO"]
+
+START = "2018-01-01"
+END   = dt.date.today().isoformat()
+LAGS  = [1, 3, 6]
+
+print("Keys present:", {"FRED": bool(FRED_KEY), "POLYGON": bool(POLYGON_KEY), "FINNHUB": bool(FINNHUB_KEY)})
+print("OUT_DIR:", OUT_DIR)
+
+# ---------- Helpers ----------
+def _get_json(url: str, params: Dict[str, Any], max_retries=3, backoff=1.0):
+    last = None
+    for i in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code == 429:
+                time.sleep(backoff * (i + 1) * 2)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(backoff * (i + 1))
+    raise RuntimeError(f"GET failed after retries: {url} | {last}")
+
+def _get_json_soft(url: str, params: Dict[str, Any], max_retries=3, backoff=1.2):
+    last = None
+    for i in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code == 429:
+                time.sleep(backoff * (i + 1))
+                continue
+            r.raise_for_status()
+            try:
+                return r.json()
+            except json.JSONDecodeError as e:
+                last = e
+        except Exception as e:
+            last = e
+        time.sleep(backoff * (i + 1))
+    print(f"[warn] _get_json_soft failed → {url} | {type(last).__name__}: {last}")
+    return None
+
+def _to_csv(df: pd.DataFrame, path: str):
+    df.to_csv(path, index=True)
+    print("Saved →", path)
+
+def make_lags(df: pd.DataFrame, cols: List[str], lags=(1,3,6)) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            continue
+        for L in lags:
+            out[f"{c}_lag{L}"] = out[c].shift(L)
+    return out
+
+def diagnostics(df: pd.DataFrame, name: str, top=8):
+    print(f"\n[Diag] {name}: shape={df.shape}, index=({df.index.min()}, {df.index.max()})")
+    if df.index.duplicated().any():
+        dup = df.index[df.index.duplicated()]
+        print(f"[Diag] WARNING: duplicate index rows={len(dup)}")
+    na_pct = df.isna().mean().sort_values(ascending=False).head(top)
+    print("[Diag] Top NaN%:\n", na_pct.to_string())
+
+# ---------- FRED ----------
+def fred_series_monthly(series_id: str, start: str, end: str, how="mean") -> pd.Series:
+    if not FRED_KEY:
+        raise RuntimeError("Missing FRED_API_KEY in .env")
+    params = {
+        "series_id": series_id,
+        "api_key":   FRED_KEY,
+        "file_type": "json",
+        "observation_start": start,
+        "observation_end":   end,
+    }
+    js = _get_json(FRED_BASE, params)
+    obs = js.get("observations", [])
+    if not obs:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame(obs)
+    df["date"]  = pd.to_datetime(df["date"])
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    s = df.set_index("date")["value"].astype(float)
+    return s.resample("ME").last() if how == "last" else s.resample("ME").mean()
+
+def get_macro_block(start: str, end: str) -> pd.DataFrame:
+    series = {
+        "FEDFUNDS": "fed_funds_rate",
+        "CPIAUCSL": "cpi_index",
+        "DGS10":    "us10y",
+        "UNRATE":   "unemployment_rate",
+    }
+    cols = {}
+    for sid, name in series.items():
+        cols[name] = fred_series_monthly(sid, start, end, how="mean")
+    macro = pd.DataFrame(cols).sort_index()
+    if "cpi_index" in macro:
+        macro["inflation_yoy"] = macro["cpi_index"].pct_change(12) * 100
+    if "us10y" in macro:
+        macro["us10y_chg"] = macro["us10y"].diff(1)
+    if "fed_funds_rate" in macro:
+        macro["fedfunds_chg"] = macro["fed_funds_rate"].diff(1)
+    if "unemployment_rate" in macro:
+        macro["unrate_chg"] = macro["unemployment_rate"].diff(1)
+    diagnostics(macro, "macro monthly")
+    _to_csv(macro, os.path.join(OUT_DIR, "macro_monthly.csv"))
+    return macro
+
+# ---------- yfinance ----------
+def yf_download_guard(tickers, start, end, tries=3, pause=1.0):
+    last_err = None
+    for i in range(tries):
+        try:
+            return yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
+        except Exception as e:
+            last_err = e
+            time.sleep(pause * (i+1))
+    print(f"[warn] yfinance download failed for {tickers} | {last_err}")
+    return pd.DataFrame()
+
+def monthly_from_yf(tickers, start, end) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    data = yf_download_guard(tickers, start, end)
+    if data is None or data.empty or "Close" not in data:
+        return pd.DataFrame(), pd.DataFrame()
+    close = data["Close"]
+    if isinstance(close, pd.Series):
+        name = tickers if isinstance(tickers, str) else tickers[0]
+        close = close.to_frame(name=name)
+    m = close.resample("ME").last()
+    rets = m.pct_change()
+    return m, rets
+
+# ---------- News sentiment ----------
+# VADER
+try:
+    import nltk
+    from nltk.sentiment import SentimentIntensityAnalyzer
+    try:
+        nltk.data.find("sentiment/vader_lexicon")
+    except LookupError:
+        nltk.download("vader_lexicon", quiet=True)
+    _VADER_OK = True
+except Exception:
+    _VADER_OK = False
+
+def simple_sentiment(text: str) -> float:
+    if not isinstance(text, str) or not text.strip():
+        return 0.0
+    if _VADER_OK:
+        sia = SentimentIntensityAnalyzer()
+        return float(sia.polarity_scores(text)["compound"])
+    t = text.lower()
+    pos = sum(w in t for w in ["beat","record","growth","surge","profit","upgrade","outperform","strong","rally"])
+    neg = sum(w in t for w in ["miss","cut","probe","lawsuit","downgrade","decline","headwind","weak","plunge"])
+    return (pos - neg) / 6.0
+
+def polygon_news_raw(ticker: str, start=None, end=None, max_pages=8, page_limit=100):
+    cols = ["date","headline","summary","source"]
+    if not POLYGON_KEY:
+        return pd.DataFrame(columns=cols)
+    url = f"{POLY_BASE}/v2/reference/news"
+    params = {
+        "ticker": ticker,
+        "limit": min(page_limit, 1000),
+        "order": "desc",
+        "apiKey": POLYGON_KEY,
+    }
+    if start: params["published_utc.gte"] = pd.Timestamp(start).strftime("%Y-%m-%d")
+    if end:   params["published_utc.lte"] = pd.Timestamp(end).strftime("%Y-%m-%d")
+
+    all_rows, pages, cursor = [], 0, None
+    while True:
+        if cursor:
+            params["cursor"] = cursor
+        js = _get_json_soft(url, params)
+        if not js or not js.get("results"):
+            break
+        for r in js["results"]:
+            d  = pd.to_datetime(r.get("published_utc"), errors="coerce", utc=True)
+            tl = r.get("title", "") or ""
+            ds = r.get("description", "") or ""
+            if pd.isna(d):
+                continue
+            # compare in UTC to avoid tz issues
+            if start and d < pd.Timestamp(start, tz="UTC"):
+                break
+            all_rows.append({"date": d.tz_convert(None), "headline": tl, "summary": ds, "source": "polygon"})
+        pages += 1
+        cursor = js.get("next_url") or js.get("next") or js.get("cursor")
+        if not cursor or pages >= max_pages:
+            break
+        time.sleep(0.3)
+
+    if not all_rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(all_rows).sort_values("date")
+    return df[cols]
+
+def finnhub_news_raw(ticker: str, start: str, end: str, chunk="365D"):
+    cols = ["date","headline","summary","source"]
+    if not FINNHUB_KEY:
+        return pd.DataFrame(columns=cols)
+    start_ts = pd.Timestamp(start)
+    end_ts   = pd.Timestamp(end)
+    step     = pd.Timedelta(chunk)
+    frames = []
+    lo = start_ts
+    while lo <= end_ts:
+        hi = min(lo + step, end_ts)
+        url = f"{FINNHUB_BASE}/company-news"
+        params = {"symbol": ticker, "from": lo.date().isoformat(), "to": hi.date().isoformat(), "token": FINNHUB_KEY}
+        js = _get_json_soft(url, params)
+        if isinstance(js, list) and js:
+            df = pd.DataFrame(js)
+            d  = pd.to_datetime(df.get("datetime"), unit="s", errors="coerce", utc=True)
+            if d.isna().all():
+                d = pd.to_datetime(df.get("time"), unit="ms", errors="coerce", utc=True)
+            df_out = pd.DataFrame({
+                "date": d.dt.tz_convert(None),
+                "headline": (df.get("headline") or "").astype(str),
+                "summary":  (df.get("summary") or "").astype(str),
+                "source":   "finnhub",
+            }).dropna(subset=["date"])
+            if not df_out.empty:
+                frames.append(df_out)
+        lo = hi + pd.Timedelta("1D")
+        time.sleep(0.25)
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(frames, ignore_index=True).sort_values("date")[cols]
+
+def build_monthly_news_sentiment_combined(ticker: str, start: str, end: str, dedup_within_days=3) -> pd.DataFrame:
+    poly = polygon_news_raw(ticker, start, end)
+    fin  = finnhub_news_raw(ticker, start, end)
+    if (poly is None or poly.empty) and (fin is None or fin.empty):
+        return pd.DataFrame(columns=[
+            "sent_mean","sent_count","sent_mean_weighted",
+            "sent_mean_poly","sent_count_poly","sent_mean_fin","sent_count_fin"
+        ])
+
+    combined = pd.concat([df for df in [poly, fin] if df is not None and not df.empty], ignore_index=True)
+    combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+    combined = combined.dropna(subset=["date"]).copy()
+    for col in ["headline","summary"]:
+        if col not in combined.columns: combined[col] = ""
+        combined[col] = combined[col].fillna("").astype(str)
+
+    if dedup_within_days and dedup_within_days > 0:
+        rd = f"{dedup_within_days}D"
+        combined["date_round"] = combined["date"].dt.floor(rd)
+        combined = combined.drop_duplicates(subset=["date_round","headline"])
+
+    texts = combined["headline"] + ". " + combined["summary"]
+    combined["sent"] = texts.apply(simple_sentiment)
+    combined["month"] = combined["date"].dt.to_period("M").dt.to_timestamp("M")
+
+    src = combined.groupby(["month","source"]).agg(sent_mean=("sent","mean"), sent_count=("sent","size")).reset_index()
+    src_piv = src.pivot(index="month", columns="source", values=["sent_mean","sent_count"])
+
+    for c in [("sent_mean","polygon"),("sent_mean","finnhub"),("sent_count","polygon"),("sent_count","finnhub")]:
+        if c not in src_piv.columns:
+            src_piv[c] = np.nan if "mean" in c[0] else 0
+    src_piv = src_piv.sort_index()
+
+    out = pd.DataFrame(index=src_piv.index)
+    out["sent_mean_poly"]  = src_piv[("sent_mean","polygon")]
+    out["sent_count_poly"] = src_piv[("sent_count","polygon")].fillna(0).astype(int)
+    out["sent_mean_fin"]   = src_piv[("sent_mean","finnhub")]
+    out["sent_count_fin"]  = src_piv[("sent_count","finnhub")].fillna(0).astype(int)
+
+    all_month = combined.groupby("month").agg(sent_mean=("sent","mean"), sent_count=("sent","size"))
+    out = out.join(all_month, how="outer")
+
+    num = (out["sent_mean_poly"].fillna(0) * out["sent_count_poly"].astype(float) +
+           out["sent_mean_fin"].fillna(0)  * out["sent_count_fin"].astype(float))
+    den = (out["sent_count_poly"].astype(float) + out["sent_count_fin"].astype(float))
+    out["sent_mean_weighted"] = np.where(den > 0, num/den, np.nan)
+
+    return out[[
+        "sent_mean","sent_count","sent_mean_weighted",
+        "sent_mean_poly","sent_count_poly","sent_mean_fin","sent_count_fin"
+    ]].sort_index()
+
+# ---------- Earnings (optional) ----------
+def finnhub_earnings(ticker: str, start: str, end: str) -> pd.DataFrame:
+    if not FINNHUB_KEY:
+        return pd.DataFrame(columns=["date","epsActual","epsEstimate","surprisePercent"])
+    url = f"{FINNHUB_BASE}/stock/earnings"
+    params = {"symbol": ticker, "token": FINNHUB_KEY}
+    try:
+        js = _get_json(url, params)
+    except Exception:
+        js = []
+    if not isinstance(js, list) or len(js) == 0:
+        url2 = f"{FINNHUB_BASE}/calendar/earnings"
+        params2 = {"from": start, "to": end, "token": FINNHUB_KEY}
+        js2 = _get_json(url2, params2)
+        df2 = pd.DataFrame(js2.get("earningsCalendar", []))
+        if df2.empty:
+            return pd.DataFrame(columns=["date","epsActual","epsEstimate","surprisePercent"])
+        df2["date"] = pd.to_datetime(df2["date"], errors="coerce")
+        df2 = df2[df2.get("symbol","") == ticker]
+        keep = [c for c in ["date","epsActual","epsEstimate","surprisePercent"] if c in df2.columns]
+        return df2[keep].dropna(subset=["date"]).sort_values("date")
+    df = pd.DataFrame(js)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    elif "period" in df.columns:
+        df["date"] = pd.to_datetime(df["period"], errors="coerce")
+    if "surprisePercent" not in df.columns and {"epsActual","epsEstimate"} <= set(df.columns):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            df["surprisePercent"] = (df["epsActual"] - df["epsEstimate"]) / df["epsEstimate"] * 100.0
+    keep = [c for c in ["date","epsActual","epsEstimate","surprisePercent"] if c in df.columns]
+    return df[keep].dropna(subset=["date"]).sort_values("date")
+
+def monthly_earnings_features(ticker: str) -> pd.DataFrame:
+    df = finnhub_earnings(ticker, START, END)
+    if df.empty:
+        return pd.DataFrame(columns=["eps_surprise_mean","eps_surprise_last"])
+    df["month"] = df["date"].dt.to_period("M").dt.to_timestamp("M")
+    agg = df.groupby("month").agg(eps_surprise_mean=("surprisePercent","mean"),
+                                  eps_surprise_last=("surprisePercent","last")).sort_index()
+    return agg
+
+# ---------- Build features ----------
+def build_ticker_features(ticker: str, macro: pd.DataFrame,
+                          ixic_rets: pd.DataFrame, xlk_rets: pd.DataFrame, ai_ret_eqw: pd.DataFrame,
+                          news_sent: Dict[str, pd.DataFrame], earnings_map: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    _, rets = monthly_from_yf(ticker, START, END)
+    if rets is None or rets.empty:
+        # Keep a skeleton frame to allow macro join and continue
+        rets = pd.DataFrame(index=macro.index, data={f"{ticker}_ret": np.nan})
+    else:
+        rets = rets.rename(columns={rets.columns[0]: f"{ticker}_ret"})
+    feats = rets.join(ixic_rets, how="left").join(xlk_rets, how="left").join(ai_ret_eqw, how="left")
+    if ticker in news_sent and not news_sent[ticker].empty:
+        feats = feats.join(news_sent[ticker], how="left")
+    if ticker in earnings_map and not earnings_map[ticker].empty:
+        feats = feats.join(earnings_map[ticker], how="left")
+
+    base_feats = ["inflation_yoy","us10y","us10y_chg","fed_funds_rate","fedfunds_chg","unemployment_rate","unrate_chg"]
+    macro_lagged = make_lags(macro, base_feats, lags=LAGS)
+    feats = feats.join(macro_lagged, how="left")
+
+    max_lag = max(LAGS) if LAGS else 0
+    if len(feats) > max_lag:
+        feats = feats.iloc[max_lag:]
+    return feats
+
+def fit_ols_safe(df: pd.DataFrame, target_col: str, min_rows: int = 12):
+    if not _SM_OK:
+        print("[info] statsmodels not installed – skipping OLS.")
+        return None, {"rows_before": len(df), "rows_after_dropna": None, "n_features": None}
+    X = df.drop(columns=[target_col])
+    y = df[target_col]
+    aligned = pd.concat([y, X], axis=1).dropna()
+    info = {"rows_before": len(df), "rows_after_dropna": len(aligned), "n_features": X.shape[1]}
+    if len(aligned) < min_rows:
+        print(f"[info] Not enough rows after dropna for {target_col}: {len(aligned)} (need >= {min_rows}).")
+        return None, info
+    y_clean = aligned.iloc[:,0]
+    X_clean = aligned.iloc[:,1:]
+    X_clean = sm.add_constant(X_clean, has_constant="add")
+    m = sm.OLS(y_clean, X_clean).fit()
+    return m, info
+
+# ---------- Main ----------
+def main():
+    # 1) Macro
+    macro = get_macro_block(START, END)
+
+    # 2) Index & AI returns
+    _, ixic_rets = monthly_from_yf("^IXIC", START, END); 
+    if ixic_rets is None or ixic_rets.empty: ixic_rets = pd.DataFrame(index=macro.index, data={"ixic_ret": np.nan})
+    else: ixic_rets.columns = ["ixic_ret"]
+
+    _,  xlk_rets = monthly_from_yf("XLK",   START, END);
+    if xlk_rets is None or xlk_rets.empty:  xlk_rets = pd.DataFrame(index=macro.index, data={"xlk_ret": np.nan})
+    else: xlk_rets.columns  = ["xlk_ret"]
+
+    _, ai_rets  = monthly_from_yf(AI_BASKET, START, END)
+    if ai_rets is None or ai_rets.empty:
+        ai_ret_eqw = pd.DataFrame(index=macro.index, data={"ai_basket_ret": np.nan})
+    else:
+        ai_ret_eqw = ai_rets.mean(axis=1).to_frame(name="ai_basket_ret")
+
+    _to_csv(ixic_rets, os.path.join(OUT_DIR, "ixic_rets.csv"))
+    _to_csv(xlk_rets,  os.path.join(OUT_DIR, "xlk_rets.csv"))
+    _to_csv(ai_ret_eqw, os.path.join(OUT_DIR, "ai_basket_rets.csv"))
+
+    # 3) News (optional)
+    news_map: Dict[str, pd.DataFrame] = {}
+    if POLYGON_KEY or FINNHUB_KEY:
+        for t in TECH_TICKERS:
+            print(f"News sentiment for {t} ...")
+            s = build_monthly_news_sentiment_combined(t, START, END)
+            news_map[t] = s
+            _to_csv(s, os.path.join(OUT_DIR, f"{t}_news_sentiment_combined.csv"))
+    else:
+        print("[info] No news APIs configured – skipping news sentiment.")
+
+    # 4) Earnings (optional)
+    earnings_map: Dict[str, pd.DataFrame] = {}
+    if FINNHUB_KEY:
+        for t in TECH_TICKERS:
+            print(f"Earnings features for {t} ...")
+            e = monthly_earnings_features(t)
+            earnings_map[t] = e
+            _to_csv(e, os.path.join(OUT_DIR, f"{t}_earnings_features.csv"))
+    else:
+        print("[info] No FINNHUB_API_KEY – skipping earnings.")
+
+    # 5) Per-ticker features
+    all_feat: Dict[str, pd.DataFrame] = {}
+    for t in TECH_TICKERS:
+        print(f"Features for {t} ...")
+        ft = build_ticker_features(t, macro, ixic_rets, xlk_rets, ai_ret_eqw, news_map, earnings_map)
+        diagnostics(ft, f"{t} features")
+        all_feat[t] = ft
+        _to_csv(ft, os.path.join(OUT_DIR, f"{t}_features_enriched.csv"))
+
+    combined = pd.concat(all_feat, axis=1)
+    _to_csv(combined, os.path.join(OUT_DIR, "tech_features_combined.csv"))
+
+    # 6) Quick OLS
+    if _SM_OK:
+        for t in TECH_TICKERS:
+            print(f"\n=== {t} OLS (enriched) ===")
+            df_t = all_feat[t].copy()
+            target = f"{t}_ret"
+            na_rates = df_t.drop(columns=[target]).isna().mean()
+            keep_feats = na_rates.sort_values().index[:20].tolist()
+            df_red = df_t[[target] + keep_feats]
+            m, info = fit_ols_safe(df_red, target)
+            if m is not None:
+                try:
+                    print(m.summary())
+                except Exception as e:
+                    print("OLS summary print failed:", e)
+                    print("Params:", m.params)
+    else:
+        print("[info] statsmodels not installed – skipped OLS.")
+
+    print("\nDone. CSVs are in:", OUT_DIR)
+
+if __name__ == "__main__":
+    main()
