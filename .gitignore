@@ -6,3 +6,19 @@ data_cache/
 *.csv
 *.parquet
 .env
+# local env & caches
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data_cache/
+# local artifacts
+*.tgz
+*.zip
+*.parquet
+*.csv
+# notebooks extras
+notebooks/*.xlsx
+notebooks/*_bak.ipynb
+# secrets
+.env
